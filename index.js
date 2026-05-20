@@ -19,6 +19,9 @@ const CONTENT_CLOSE_RE = /<\/content>/i;
 const DEFAULT_START_TAG = 'image###';
 const DEFAULT_END_TAG = '###';
 const STREAM_ENVELOPE_RE = /\b(?:data:\s*\{|choices|finish_reason|prompt_tokens|completion_tokens|chat\.completion\.chunk|\"delta\"|\"usage\")\b/i;
+const SSE_DATA_RE = /^data:\s*\{/m;
+const BODY_END_MARK = '<!-- 正文结束 -->';
+const CHATU8_ACTION_RE = /chatu|image|novelai|nai|sd|comfy|banana|绘|图|生成|插图/i;
 const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const ACTIVE_TTL_MS = 3 * 60 * 1000;
 const PATCH_DEBOUNCE_MS = 160;
@@ -251,7 +254,7 @@ function addPendingBlocks(messageId, blocks) {
 }
 
 function getInsertionIndex(base) {
-    const bodyEndIndex = base.indexOf('<!-- 正文结束 -->');
+    const bodyEndIndex = base.indexOf(BODY_END_MARK);
     if (bodyEndIndex >= 0) {
         return bodyEndIndex;
     }
@@ -319,7 +322,8 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
 
     const message = chat[id];
     const rawCurrentText = String(message.mes ?? '');
-    const currentText = removePollutedImageBlocks(rawCurrentText);
+    const unwrappedText = unwrapSseEnvelopeText(rawCurrentText);
+    const currentText = removePollutedImageBlocks(unwrappedText);
     const currentBlocks = extractImageBlocks(currentText);
     const queuedBlocks = pendingImageBlocks.get(id) || [];
     const allBlocks = cleanImageBlocks([...currentBlocks, ...queuedBlocks]);
@@ -341,6 +345,10 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
     }
 
     let patched = currentText;
+
+    if (snapshot && isSseEnvelopeText(rawCurrentText) && allBlocks.length === 0) {
+        patched = snapshot;
+    }
 
     if (allBlocks.length > 0 || shouldRepairFromSnapshot(id, currentText, allBlocks)) {
         const base = chooseBaseText(id, currentText);
@@ -503,6 +511,48 @@ function collectBlocksFromResponseText(responseText) {
     return cleanImageBlocks(blocks);
 }
 
+function isSseEnvelopeText(text) {
+    return SSE_DATA_RE.test(String(text ?? '')) && /\"delta\"\s*:\s*\{/.test(String(text ?? ''));
+}
+
+function contentToOpenAiJson(content) {
+    return JSON.stringify({
+        choices: [
+            {
+                message: { content },
+                delta: { content },
+                finish_reason: 'stop',
+            },
+        ],
+    });
+}
+
+function shouldNormalizeFetchResponse(responseText) {
+    if (!isSseEnvelopeText(responseText)) {
+        return false;
+    }
+
+    const targetId = getTargetMessageId();
+    return targetId !== null && Date.now() < activeUntil;
+}
+
+function makeNormalizedResponse(originalResponse, responseText) {
+    const content = collectSseContent(responseText);
+    if (!content) {
+        return originalResponse;
+    }
+
+    const headers = new Headers(originalResponse.headers);
+    headers.set('content-type', 'application/json; charset=utf-8');
+    headers.delete('content-length');
+
+    return new Response(contentToOpenAiJson(content), {
+        status: originalResponse.status,
+        statusText: originalResponse.statusText,
+        headers,
+    });
+}
+
 function wrapFetch() {
     if (window[FETCH_FLAG] || typeof window.fetch !== 'function') {
         return;
@@ -516,25 +566,33 @@ function wrapFetch() {
 
         try {
             const cloned = response.clone();
-            cloned.text().then((text) => {
-                const blocks = collectBlocksFromResponseText(text);
-                if (blocks.length === 0) {
-                    return;
-                }
-
+            const text = await cloned.text();
+            const blocks = collectBlocksFromResponseText(text);
+            if (blocks.length > 0) {
                 const targetId = getTargetMessageId();
-                if (targetId === null) {
-                    return;
+                if (targetId !== null) {
+                    addPendingBlocks(targetId, blocks);
                 }
+            }
 
-                addPendingBlocks(targetId, blocks);
-            }).catch(() => {});
+            if (shouldNormalizeFetchResponse(text)) {
+                return makeNormalizedResponse(response, text);
+            }
         } catch {
             // Some streamed responses cannot be cloned in every browser path.
         }
 
         return response;
     };
+}
+
+function unwrapSseEnvelopeText(text) {
+    if (!isSseEnvelopeText(text)) {
+        return text;
+    }
+
+    const content = collectSseContent(text);
+    return content || text;
 }
 
 function onPossibleChatu8Action(event) {
@@ -548,7 +606,7 @@ function onPossibleChatu8Action(event) {
 
     const text = String(target?.textContent || target?.title || target?.ariaLabel || '');
     const className = String(target?.className || '');
-    if (/chatu|绘|图|image|novelai|nai/i.test(`${text} ${className}`)) {
+    if (CHATU8_ACTION_RE.test(`${text} ${className}`)) {
         const fallbackId = getLastAssistantMessageId();
         if (fallbackId !== null) {
             markActiveMessage(fallbackId, `${event.type}:fallback`);
