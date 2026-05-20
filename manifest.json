@@ -1,6 +1,6 @@
 {
     "display_name": "st-chatu8-subtext-patch",
-    "loading_order": 99,
+    "loading_order": 8,
     "requires": [],
     "optional": [
         "st-chatu8"

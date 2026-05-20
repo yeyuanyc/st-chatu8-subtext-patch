@@ -20,8 +20,9 @@ const DEFAULT_START_TAG = 'image###';
 const DEFAULT_END_TAG = '###';
 const STREAM_ENVELOPE_RE = /\b(?:data:\s*\{|choices|finish_reason|prompt_tokens|completion_tokens|chat\.completion\.chunk|\"delta\"|\"usage\")\b/i;
 const SSE_DATA_RE = /^data:\s*\{/m;
-const BODY_END_MARK = '<!-- 正文结束 -->';
-const CHATU8_ACTION_RE = /chatu|image|novelai|nai|sd|comfy|banana|绘|图|生成|插图/i;
+const BODY_END_MARK = '<!-- \u6b63\u6587\u7ed3\u675f -->';
+const CHATU8_ACTION_RE = /chatu|image|novelai|nai|sd|comfy|banana|\u7ed8|\u56fe|\u751f\u6210|\u63d2\u56fe/i;
+const CHATU8_REPLY_RE = /<images?>|<\/images?>|<Tag_think>|<\/Tag_think>|regex\s*:|image#{0,3}\s*(?:Scene Composition|$)/i;
 const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const ACTIVE_TTL_MS = 3 * 60 * 1000;
 const PATCH_DEBOUNCE_MS = 160;
@@ -527,17 +528,20 @@ function contentToOpenAiJson(content) {
     });
 }
 
-function shouldNormalizeFetchResponse(responseText) {
+function shouldNormalizeFetchResponse(responseText, content = collectSseContent(responseText)) {
     if (!isSseEnvelopeText(responseText)) {
         return false;
+    }
+
+    if (CHATU8_REPLY_RE.test(content) || hasImageBlock(content)) {
+        return true;
     }
 
     const targetId = getTargetMessageId();
     return targetId !== null && Date.now() < activeUntil;
 }
 
-function makeNormalizedResponse(originalResponse, responseText) {
-    const content = collectSseContent(responseText);
+function makeNormalizedResponse(originalResponse, responseText, content = collectSseContent(responseText)) {
     if (!content) {
         return originalResponse;
     }
@@ -567,6 +571,7 @@ function wrapFetch() {
         try {
             const cloned = response.clone();
             const text = await cloned.text();
+            const sseContent = collectSseContent(text);
             const blocks = collectBlocksFromResponseText(text);
             if (blocks.length > 0) {
                 const targetId = getTargetMessageId();
@@ -575,8 +580,8 @@ function wrapFetch() {
                 }
             }
 
-            if (shouldNormalizeFetchResponse(text)) {
-                return makeNormalizedResponse(response, text);
+            if (shouldNormalizeFetchResponse(text, sseContent)) {
+                return makeNormalizedResponse(response, text, sseContent);
             }
         } catch {
             // Some streamed responses cannot be cloned in every browser path.
