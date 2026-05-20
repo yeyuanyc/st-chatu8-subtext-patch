@@ -18,6 +18,7 @@ const CONTENT_OPEN_RE = /<content\b[^>]*>/i;
 const CONTENT_CLOSE_RE = /<\/content>/i;
 const DEFAULT_START_TAG = 'image###';
 const DEFAULT_END_TAG = '###';
+const STREAM_ENVELOPE_RE = /\b(?:data:\s*\{|choices|finish_reason|prompt_tokens|completion_tokens|chat\.completion\.chunk|\"delta\"|\"usage\")\b/i;
 const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const ACTIVE_TTL_MS = 3 * 60 * 1000;
 const PATCH_DEBOUNCE_MS = 160;
@@ -194,6 +195,14 @@ function uniqueBlocks(blocks) {
     return result;
 }
 
+function isPollutedImageBlock(block) {
+    return STREAM_ENVELOPE_RE.test(String(block ?? ''));
+}
+
+function cleanImageBlocks(blocks) {
+    return uniqueBlocks(blocks).filter((block) => !isPollutedImageBlock(block));
+}
+
 function extractImageBlocks(text) {
     if (typeof text !== 'string' || !text) {
         return [];
@@ -208,7 +217,7 @@ function extractImageBlocks(text) {
         }
     }
 
-    return uniqueBlocks(blocks);
+    return cleanImageBlocks(blocks);
 }
 
 function removeImageBlocks(text) {
@@ -220,9 +229,18 @@ function removeImageBlocks(text) {
     return output.replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
 }
 
+function removePollutedImageBlocks(text) {
+    let output = String(text ?? '');
+    for (const regex of getImageRegexes()) {
+        regex.lastIndex = 0;
+        output = output.replace(regex, (block) => isPollutedImageBlock(block) ? '' : block);
+    }
+    return output.replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
+}
+
 function addPendingBlocks(messageId, blocks) {
     const id = Number(messageId);
-    const cleanBlocks = uniqueBlocks(blocks);
+    const cleanBlocks = cleanImageBlocks(blocks);
     if (!Number.isInteger(id) || id < 0 || cleanBlocks.length === 0) {
         return;
     }
@@ -247,7 +265,7 @@ function getInsertionIndex(base) {
 }
 
 function mergeBlocksIntoBase(baseText, blocks) {
-    const cleanBlocks = uniqueBlocks(blocks);
+    const cleanBlocks = cleanImageBlocks(blocks);
     if (cleanBlocks.length === 0) {
         return baseText;
     }
@@ -300,13 +318,24 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
     }
 
     const message = chat[id];
-    const currentText = String(message.mes ?? '');
+    const rawCurrentText = String(message.mes ?? '');
+    const currentText = removePollutedImageBlocks(rawCurrentText);
     const currentBlocks = extractImageBlocks(currentText);
     const queuedBlocks = pendingImageBlocks.get(id) || [];
-    const allBlocks = uniqueBlocks([...currentBlocks, ...queuedBlocks]);
+    const allBlocks = cleanImageBlocks([...currentBlocks, ...queuedBlocks]);
     const snapshot = snapshots.get(id)?.text;
 
     if (!snapshot && allBlocks.length === 0) {
+        if (currentText !== rawCurrentText) {
+            message.mes = currentText;
+            if (rerender) {
+                updateMessageBlock(id, message);
+            }
+            if (save) {
+                scheduleSave();
+            }
+            return true;
+        }
         snapshotMessage(id, reason, false);
         return false;
     }
@@ -322,7 +351,7 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
         patched = allBlocks.length > 0 ? mergeBlocksIntoBase(snapshot, allBlocks) : snapshot;
     }
 
-    if (patched === currentText) {
+    if (patched === rawCurrentText) {
         snapshotMessage(id, reason, false);
         return false;
     }
@@ -399,20 +428,79 @@ function collectStrings(value, result = []) {
     return result;
 }
 
-function collectBlocksFromResponseText(responseText) {
-    const blocks = [];
-    blocks.push(...extractImageBlocks(responseText));
+function collectSseContent(responseText) {
+    const parts = [];
+    const events = String(responseText ?? '').split(/\r?\n\r?\n/);
 
-    try {
-        const parsed = JSON.parse(responseText);
-        for (const text of collectStrings(parsed)) {
-            blocks.push(...extractImageBlocks(text));
+    for (const event of events) {
+        const lines = event.split(/\r?\n/);
+        for (const line of lines) {
+            if (!line.startsWith('data:')) {
+                continue;
+            }
+
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') {
+                continue;
+            }
+
+            try {
+                const parsed = JSON.parse(payload);
+                const deltaContent = parsed?.choices?.[0]?.delta?.content;
+                const messageContent = parsed?.choices?.[0]?.message?.content;
+                const text = deltaContent ?? messageContent;
+                if (typeof text === 'string') {
+                    parts.push(text);
+                }
+            } catch {
+                // Ignore non-JSON SSE lines.
+            }
         }
-    } catch {
-        // Non-JSON/SSE responses are handled by the raw scan above.
     }
 
-    return uniqueBlocks(blocks);
+    return parts.join('');
+}
+
+function collectJsonContent(responseText) {
+    try {
+        const parsed = JSON.parse(responseText);
+        const preferred = [
+            parsed?.choices?.[0]?.message?.content,
+            parsed?.choices?.[0]?.delta?.content,
+            parsed?.message?.content,
+            parsed?.content,
+            parsed?.text,
+        ].filter((item) => typeof item === 'string');
+
+        if (preferred.length > 0) {
+            return preferred.join('');
+        }
+
+        return collectStrings(parsed).join('\n');
+    } catch {
+        return '';
+    }
+}
+
+function collectBlocksFromResponseText(responseText) {
+    const text = String(responseText ?? '');
+    const blocks = [];
+    const sseContent = collectSseContent(text);
+    const jsonContent = collectJsonContent(text);
+
+    if (sseContent) {
+        blocks.push(...extractImageBlocks(sseContent));
+    }
+
+    if (jsonContent) {
+        blocks.push(...extractImageBlocks(jsonContent));
+    }
+
+    if (!sseContent && !jsonContent && !/^data:\s*\{/m.test(text)) {
+        blocks.push(...extractImageBlocks(text));
+    }
+
+    return cleanImageBlocks(blocks);
 }
 
 function wrapFetch() {
