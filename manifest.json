@@ -1,0 +1,12 @@
+{
+    "display_name": "st-chatu8-subtext-patch",
+    "loading_order": 99,
+    "requires": [],
+    "optional": [
+        "st-chatu8"
+    ],
+    "js": "index.js",
+    "author": "local patch",
+    "version": "1.0.0",
+    "homePage": ""
+}
