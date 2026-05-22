@@ -10,6 +10,7 @@ import { extension_settings } from '../../../extensions.js';
 const PATCH_FLAG = '__stChatu8SubtextPatchLoaded';
 const PATCH_NAME = 'st-chatu8-subtext-patch';
 const CHATU8_NAME = 'st-chatu8';
+const CHATU8_LLM_IMAGE_GEN_RESPONSE = 'ch-llm-image-gen-response';
 
 const BEGIN = '<!-- begin_of_Subtext_think -->';
 const END = '<!-- end_of_Subtext_think -->';
@@ -17,6 +18,8 @@ const CONTENT_OPEN_RE = /<content\b[^>]*>/i;
 const CONTENT_CLOSE_RE = /<\/content>/i;
 const DEFAULT_START_TAG = 'image###';
 const DEFAULT_END_TAG = '###';
+const IMAGES_CONTAINER_RE = /<images\b[^>]*>[\s\S]*?<\/images>/gi;
+const IMAGE_TAG_RE = /<image\b[^>]*>[\s\S]*?<\/image>/i;
 const BODY_END_MARK = '<!-- \u6b63\u6587\u7ed3\u675f -->';
 const CHATU8_ACTION_RE = /chatu|image|novelai|nai|sd|comfy|banana|\u7ed8|\u56fe|\u751f\u6210|\u63d2\u56fe/i;
 const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
@@ -208,8 +211,38 @@ function cleanImageBlocks(blocks) {
     return uniqueBlocks(blocks);
 }
 
+function normalizeLegacyImageContainers(text) {
+    let output = String(text ?? '');
+    for (const regex of getImageRegexes()) {
+        regex.lastIndex = 0;
+        output = output.replace(IMAGES_CONTAINER_RE, (container) => {
+            regex.lastIndex = 0;
+            const blocks = [];
+            let match;
+            while ((match = regex.exec(container)) !== null) {
+                blocks.push(match[0]);
+            }
+            return !IMAGE_TAG_RE.test(container) && blocks.length > 0
+                ? cleanImageBlocks(blocks).join('\n')
+                : container;
+        });
+    }
+    return output;
+}
+
+function removeEmptyImageContainers(text) {
+    return String(text ?? '').replace(IMAGES_CONTAINER_RE, (container) => {
+        const inner = container
+            .replace(/^<images\b[^>]*>/i, '')
+            .replace(/<\/images>$/i, '')
+            .trim();
+        return inner.length === 0 || !IMAGE_TAG_RE.test(container) ? '' : container;
+    }).replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
+}
+
 function extractImageBlocks(text) {
-    if (typeof text !== 'string' || !text) {
+    const normalizedText = normalizeLegacyImageContainers(text);
+    if (typeof normalizedText !== 'string' || !normalizedText) {
         return [];
     }
 
@@ -217,7 +250,7 @@ function extractImageBlocks(text) {
     for (const regex of getImageRegexes()) {
         regex.lastIndex = 0;
         let match;
-        while ((match = regex.exec(text)) !== null) {
+        while ((match = regex.exec(normalizedText)) !== null) {
             blocks.push(match[0]);
         }
     }
@@ -226,20 +259,32 @@ function extractImageBlocks(text) {
 }
 
 function removeImageBlocks(text) {
-    let output = String(text ?? '');
+    let output = normalizeLegacyImageContainers(text);
     for (const regex of getImageRegexes()) {
         regex.lastIndex = 0;
         output = output.replace(regex, '');
     }
-    return output.replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
+    return removeEmptyImageContainers(output);
 }
 
 function removeSpecificImageBlocks(text, blocks) {
-    let output = String(text ?? '');
+    let output = normalizeLegacyImageContainers(text);
     for (const block of cleanImageBlocks(blocks)) {
         output = output.replace(block, '');
     }
-    return output.replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
+    return removeEmptyImageContainers(output);
+}
+
+function normalizeChatu8ImageResponse(payload) {
+    if (!payload || typeof payload.result !== 'string') {
+        return;
+    }
+
+    const normalized = normalizeLegacyImageContainers(payload.result);
+    if (normalized !== payload.result) {
+        payload.result = normalized;
+        console.info(`[${PATCH_NAME}] normalized legacy image container in st-chatu8 response`);
+    }
 }
 
 function getInsertionIndex(base) {
@@ -467,6 +512,8 @@ function bindEvents() {
     const bindLast = typeof eventSource.makeLast === 'function'
         ? eventSource.makeLast.bind(eventSource)
         : eventSource.on.bind(eventSource);
+
+    bindFirst(CHATU8_LLM_IMAGE_GEN_RESPONSE, normalizeChatu8ImageResponse);
 
     bindFirst(event_types.MESSAGE_RECEIVED, (messageId) => snapshotMessage(messageId, 'MESSAGE_RECEIVED:first', true));
     bindFirst(event_types.MESSAGE_UPDATED, (messageId) => snapshotMessage(messageId, 'MESSAGE_UPDATED:first', false));
