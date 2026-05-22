@@ -24,10 +24,12 @@ const BODY_END_MARK = '<!-- \u6b63\u6587\u7ed3\u675f -->';
 const CHATU8_ACTION_RE = /chatu|image|novelai|nai|sd|comfy|banana|\u7ed8|\u56fe|\u751f\u6210|\u63d2\u56fe/i;
 const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const ACTIVE_TTL_MS = 3 * 60 * 1000;
+const PENDING_RESPONSE_TTL_MS = 3 * 60 * 1000;
 const PATCH_DEBOUNCE_MS = 160;
 
 const snapshots = new Map();
 const pendingTimers = new Map();
+const pendingResponseBlocks = new Map();
 
 let activeMessageId = null;
 let activeUntil = 0;
@@ -154,7 +156,6 @@ function snapshotMessage(messageId, reason = 'auto', force = false) {
     const currentScore = current ? snapshotScore(current.text) : -1;
     const nextScore = snapshotScore(text);
     const shouldKeepOld = current &&
-        !force &&
         hasSubtextBoundaries(current.text) &&
         !hasSubtextBoundaries(text);
 
@@ -187,6 +188,15 @@ function pruneSnapshots() {
     for (const [id, snapshot] of snapshots.entries()) {
         if (now - snapshot.time > SNAPSHOT_TTL_MS || !chat[id]) {
             snapshots.delete(id);
+        }
+    }
+}
+
+function prunePendingResponseBlocks() {
+    const now = Date.now();
+    for (const [id, pending] of pendingResponseBlocks.entries()) {
+        if (now - pending.time > PENDING_RESPONSE_TTL_MS || !chat[id]) {
+            pendingResponseBlocks.delete(id);
         }
     }
 }
@@ -230,13 +240,36 @@ function normalizeLegacyImageContainers(text) {
     return output;
 }
 
+function wrapLegacyImageContainersForParser(text) {
+    let output = String(text ?? '');
+    for (const regex of getImageRegexes()) {
+        regex.lastIndex = 0;
+        output = output.replace(IMAGES_CONTAINER_RE, (container) => {
+            regex.lastIndex = 0;
+            const blocks = [];
+            let match;
+            while ((match = regex.exec(container)) !== null) {
+                blocks.push(match[0]);
+            }
+            if (IMAGE_TAG_RE.test(container) || blocks.length === 0) {
+                return container;
+            }
+            const wrappedBlocks = cleanImageBlocks(blocks)
+                .map((block) => `<image>${block}</image>`)
+                .join('\n');
+            return `<images>\n${wrappedBlocks}\n</images>`;
+        });
+    }
+    return output;
+}
+
 function removeEmptyImageContainers(text) {
     return String(text ?? '').replace(IMAGES_CONTAINER_RE, (container) => {
         const inner = container
             .replace(/^<images\b[^>]*>/i, '')
             .replace(/<\/images>$/i, '')
             .trim();
-        return inner.length === 0 || !IMAGE_TAG_RE.test(container) ? '' : container;
+        return inner.length === 0 || !hasImageBlock(container) ? '' : container;
     }).replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
 }
 
@@ -280,10 +313,26 @@ function normalizeChatu8ImageResponse(payload) {
         return;
     }
 
-    const normalized = normalizeLegacyImageContainers(payload.result);
-    if (normalized !== payload.result) {
-        payload.result = normalized;
-        console.info(`[${PATCH_NAME}] normalized legacy image container in st-chatu8 response`);
+    const normalizedForCapture = normalizeLegacyImageContainers(payload.result);
+    const targetId = getActiveMessageIdOnly();
+    const blocks = extractImageBlocks(normalizedForCapture);
+    if (targetId !== null && blocks.length > 0) {
+        pendingResponseBlocks.set(targetId, {
+            blocks,
+            time: Date.now(),
+        });
+        setTimeout(() => schedulePatch(targetId, { save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE' }), 300);
+        setTimeout(() => schedulePatch(targetId, { save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE:late' }), 900);
+        console.info(`[${PATCH_NAME}] captured st-chatu8 response image blocks`, {
+            messageId: targetId,
+            blocks: blocks.length,
+        });
+    }
+
+    const parserCompatible = wrapLegacyImageContainersForParser(payload.result);
+    if (parserCompatible !== payload.result) {
+        payload.result = parserCompatible;
+        console.info(`[${PATCH_NAME}] wrapped legacy image container for st-chatu8 parser`);
     }
 }
 
@@ -410,11 +459,13 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
         return false;
     }
 
+    prunePendingResponseBlocks();
     const message = chat[id];
     const rawCurrentText = String(message.mes ?? '');
     const currentText = rawCurrentText;
     const currentBlocks = extractImageBlocks(currentText);
-    const allBlocks = cleanImageBlocks(currentBlocks);
+    const pendingBlocks = pendingResponseBlocks.get(id)?.blocks || [];
+    const allBlocks = cleanImageBlocks([...currentBlocks, ...pendingBlocks]);
     const snapshot = snapshots.get(id)?.text;
     const newBlocks = snapshot
         ? allBlocks.filter((block) => !snapshot.includes(block))
@@ -441,6 +492,9 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
     }
 
     if (patched === rawCurrentText) {
+        if (pendingBlocks.length > 0) {
+            pendingResponseBlocks.delete(id);
+        }
         snapshotMessage(id, reason, false);
         return false;
     }
@@ -459,6 +513,10 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
 
     if (save) {
         scheduleSave();
+    }
+
+    if (pendingBlocks.length > 0) {
+        pendingResponseBlocks.delete(id);
     }
 
     console.info(`[${PATCH_NAME}] repaired message ${id}`, {
