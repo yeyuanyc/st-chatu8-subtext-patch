@@ -11,6 +11,8 @@ const PATCH_FLAG = '__stChatu8SubtextPatchLoaded';
 const PATCH_NAME = 'st-chatu8-subtext-patch';
 const CHATU8_NAME = 'st-chatu8';
 const CHATU8_LLM_IMAGE_GEN_RESPONSE = 'ch-llm-image-gen-response';
+const CHATU8_LLM_IMAGE_GEN_GET_PROMPT_REQUEST = 'ch-llm-image-gen-get-prompt-request';
+const CHATU8_LLM_IMAGE_GEN_GET_PROMPT_RESPONSE = 'ch-llm-image-gen-get-prompt-response';
 
 const BEGIN = '<!-- begin_of_Subtext_think -->';
 const END = '<!-- end_of_Subtext_think -->';
@@ -30,9 +32,12 @@ const PATCH_DEBOUNCE_MS = 160;
 const snapshots = new Map();
 const pendingTimers = new Map();
 const pendingResponseBlocks = new Map();
+const pendingPromptRequests = new Map();
 
 let activeMessageId = null;
 let activeUntil = 0;
+let globalPendingResponse = null;
+let recentPromptTarget = null;
 let saveTimer = null;
 let observer = null;
 
@@ -108,6 +113,38 @@ function getActiveMessageIdOnly() {
         return activeMessageId;
     }
     return null;
+}
+
+function getBestTargetMessageId() {
+    const activeId = getActiveMessageIdOnly();
+    if (activeId !== null) {
+        return activeId;
+    }
+
+    let fallbackId = null;
+    for (let i = chat.length - 1; i >= 0; i -= 1) {
+        const message = chat[i];
+        if (!message || message.is_user) {
+            continue;
+        }
+
+        if (fallbackId === null) {
+            fallbackId = i;
+        }
+
+        const currentText = String(message.mes ?? '');
+        const snapshot = snapshots.get(i)?.text || '';
+        if (
+            hasContent(currentText) ||
+            hasSubtextBoundaries(currentText) ||
+            hasContent(snapshot) ||
+            hasSubtextBoundaries(snapshot)
+        ) {
+            return i;
+        }
+    }
+
+    return fallbackId;
 }
 
 function getActionDescriptor(element) {
@@ -199,6 +236,17 @@ function prunePendingResponseBlocks() {
             pendingResponseBlocks.delete(id);
         }
     }
+    if (globalPendingResponse && now - globalPendingResponse.time > PENDING_RESPONSE_TTL_MS) {
+        globalPendingResponse = null;
+    }
+    if (recentPromptTarget && now - recentPromptTarget.time > PENDING_RESPONSE_TTL_MS) {
+        recentPromptTarget = null;
+    }
+    for (const [id, pending] of pendingPromptRequests.entries()) {
+        if (now - pending.time > PENDING_RESPONSE_TTL_MS || !chat[pending.targetId]) {
+            pendingPromptRequests.delete(id);
+        }
+    }
 }
 
 function uniqueBlocks(blocks) {
@@ -264,10 +312,11 @@ function wrapLegacyImageContainersForParser(text) {
 }
 
 function removeEmptyImageContainers(text) {
-    return String(text ?? '').replace(IMAGES_CONTAINER_RE, (container) => {
+    return String(text ?? '').replace(/<image\b[^>]*>\s*<\/image>/gi, '').replace(IMAGES_CONTAINER_RE, (container) => {
         const inner = container
             .replace(/^<images\b[^>]*>/i, '')
             .replace(/<\/images>$/i, '')
+            .replace(/<image\b[^>]*>\s*<\/image>/gi, '')
             .trim();
         return inner.length === 0 || !hasImageBlock(container) ? '' : container;
     }).replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
@@ -308,21 +357,127 @@ function removeSpecificImageBlocks(text, blocks) {
     return removeEmptyImageContainers(output);
 }
 
+function normalizeForPromptMatch(text) {
+    return removeImageBlocks(String(text ?? ''))
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, '')
+        .toLowerCase();
+}
+
+function getContentLikeText(text) {
+    const value = String(text ?? '');
+    const openMatch = CONTENT_OPEN_RE.exec(value);
+    const closeMatch = CONTENT_CLOSE_RE.exec(value);
+    if (openMatch && closeMatch && closeMatch.index > openMatch.index) {
+        return value.slice(openMatch.index + openMatch[0].length, closeMatch.index);
+    }
+    return value;
+}
+
+function findMessageIdByPrompt(prompt, preferredId = null) {
+    const normalizedPrompt = normalizeForPromptMatch(prompt);
+    if (normalizedPrompt.length < 20) {
+        return preferredId;
+    }
+
+    let bestId = preferredId;
+    let bestScore = preferredId !== null ? 1 : 0;
+
+    for (let i = chat.length - 1; i >= 0; i -= 1) {
+        const message = chat[i];
+        if (!message || message.is_user) {
+            continue;
+        }
+
+        const texts = [
+            String(message.mes ?? ''),
+            snapshots.get(i)?.text || '',
+            getContentLikeText(message.mes),
+            getContentLikeText(snapshots.get(i)?.text || ''),
+        ];
+
+        let score = i === preferredId ? 25 : 0;
+        for (const text of texts) {
+            const normalizedText = normalizeForPromptMatch(text);
+            if (normalizedText.length < 20) {
+                continue;
+            }
+            if (normalizedPrompt.includes(normalizedText)) {
+                score = Math.max(score, normalizedText.length + 100);
+            } else if (normalizedText.includes(normalizedPrompt)) {
+                score = Math.max(score, normalizedPrompt.length + 80);
+            }
+        }
+
+        if (score > bestScore) {
+            bestId = i;
+            bestScore = score;
+        }
+    }
+
+    return bestId;
+}
+
+function rememberPromptTarget(payload, reason) {
+    prunePendingResponseBlocks();
+    const requestId = payload?.id;
+    const preferredId = requestId ? pendingPromptRequests.get(requestId)?.targetId ?? null : null;
+    const matchedId = payload?.prompt
+        ? findMessageIdByPrompt(payload.prompt, preferredId)
+        : preferredId ?? getBestTargetMessageId();
+    const targetId = matchedId ?? getBestTargetMessageId();
+
+    if (targetId === null) {
+        return null;
+    }
+
+    markActiveMessage(targetId, reason);
+    recentPromptTarget = {
+        targetId,
+        time: Date.now(),
+    };
+    if (requestId) {
+        pendingPromptRequests.set(requestId, {
+            targetId,
+            time: Date.now(),
+        });
+    }
+    return targetId;
+}
+
+function getTargetMessageIdFromPayload(payload) {
+    prunePendingResponseBlocks();
+    const requestId = payload?.id;
+    const pendingTarget = requestId ? pendingPromptRequests.get(requestId)?.targetId ?? null : null;
+    return pendingTarget ?? recentPromptTarget?.targetId ?? getBestTargetMessageId();
+}
+
 function normalizeChatu8ImageResponse(payload) {
     if (!payload || typeof payload.result !== 'string') {
         return;
     }
 
     const normalizedForCapture = normalizeLegacyImageContainers(payload.result);
-    const targetId = getActiveMessageIdOnly();
+    const targetId = getTargetMessageIdFromPayload(payload);
     const blocks = extractImageBlocks(normalizedForCapture);
-    if (targetId !== null && blocks.length > 0) {
-        pendingResponseBlocks.set(targetId, {
+    if (blocks.length > 0) {
+        globalPendingResponse = {
             blocks,
+            targetId,
             time: Date.now(),
-        });
-        setTimeout(() => schedulePatch(targetId, { save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE' }), 300);
-        setTimeout(() => schedulePatch(targetId, { save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE:late' }), 900);
+        };
+        if (targetId !== null) {
+            markActiveMessage(targetId, 'LLM_IMAGE_GEN_RESPONSE');
+            pendingResponseBlocks.set(targetId, {
+                blocks,
+                time: Date.now(),
+            });
+            setTimeout(() => schedulePatch(targetId, { save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE' }), 300);
+            setTimeout(() => schedulePatch(targetId, { save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE:late' }), 900);
+        }
+        setTimeout(() => patchAll({ save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE:all' }), 1200);
+        setTimeout(() => patchAll({ save: true, rerender: true, reason: 'LLM_IMAGE_GEN_RESPONSE:final' }), 2400);
         console.info(`[${PATCH_NAME}] captured st-chatu8 response image blocks`, {
             messageId: targetId,
             blocks: blocks.length,
@@ -398,7 +553,7 @@ function shouldRepairFromSnapshot(messageId, currentText, blocks) {
 }
 
 async function moveBlocksToActiveMessage(sourceId, blocks, reason = 'move-blocks') {
-    const targetId = getActiveMessageIdOnly();
+    const targetId = getBestTargetMessageId();
     const cleanBlocks = cleanImageBlocks(blocks);
     if (
         targetId === null ||
@@ -464,7 +619,13 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
     const rawCurrentText = String(message.mes ?? '');
     const currentText = rawCurrentText;
     const currentBlocks = extractImageBlocks(currentText);
-    const pendingBlocks = pendingResponseBlocks.get(id)?.blocks || [];
+    const localPendingBlocks = pendingResponseBlocks.get(id)?.blocks || [];
+    const globalTargetId = globalPendingResponse?.targetId ?? null;
+    const shouldUseGlobalPending = globalPendingResponse?.blocks?.length > 0 &&
+        (globalTargetId !== null ? id === globalTargetId : id === getBestTargetMessageId());
+    const pendingBlocks = shouldUseGlobalPending
+        ? cleanImageBlocks([...localPendingBlocks, ...globalPendingResponse.blocks])
+        : localPendingBlocks;
     const allBlocks = cleanImageBlocks([...currentBlocks, ...pendingBlocks]);
     const snapshot = snapshots.get(id)?.text;
     const newBlocks = snapshot
@@ -494,6 +655,9 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
     if (patched === rawCurrentText) {
         if (pendingBlocks.length > 0) {
             pendingResponseBlocks.delete(id);
+            if (globalPendingResponse && pendingBlocks.some((block) => globalPendingResponse.blocks.includes(block))) {
+                globalPendingResponse = null;
+            }
         }
         snapshotMessage(id, reason, false);
         return false;
@@ -517,6 +681,9 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
 
     if (pendingBlocks.length > 0) {
         pendingResponseBlocks.delete(id);
+        if (globalPendingResponse && pendingBlocks.some((block) => globalPendingResponse.blocks.includes(block))) {
+            globalPendingResponse = null;
+        }
     }
 
     console.info(`[${PATCH_NAME}] repaired message ${id}`, {
@@ -571,6 +738,30 @@ function bindEvents() {
         ? eventSource.makeLast.bind(eventSource)
         : eventSource.on.bind(eventSource);
 
+    bindFirst(CHATU8_LLM_IMAGE_GEN_GET_PROMPT_REQUEST, (payload) => {
+        snapshotAll('LLM_IMAGE_GEN_GET_PROMPT_REQUEST');
+        const targetId = getBestTargetMessageId();
+        if (targetId !== null) {
+            markActiveMessage(targetId, 'LLM_IMAGE_GEN_GET_PROMPT_REQUEST');
+            recentPromptTarget = {
+                targetId,
+                time: Date.now(),
+            };
+        }
+        if (payload?.id && targetId !== null) {
+            pendingPromptRequests.set(payload.id, {
+                targetId,
+                time: Date.now(),
+            });
+        }
+    });
+    bindFirst(CHATU8_LLM_IMAGE_GEN_GET_PROMPT_RESPONSE, (payload) => {
+        snapshotAll('LLM_IMAGE_GEN_GET_PROMPT_RESPONSE');
+        const targetId = rememberPromptTarget(payload, 'LLM_IMAGE_GEN_GET_PROMPT_RESPONSE');
+        if (targetId !== null) {
+            schedulePatch(targetId, { save: false, rerender: true, reason: 'LLM_IMAGE_GEN_GET_PROMPT_RESPONSE' });
+        }
+    });
     bindFirst(CHATU8_LLM_IMAGE_GEN_RESPONSE, normalizeChatu8ImageResponse);
 
     bindFirst(event_types.MESSAGE_RECEIVED, (messageId) => snapshotMessage(messageId, 'MESSAGE_RECEIVED:first', true));
@@ -610,7 +801,11 @@ function observeChatDom() {
     observer = new MutationObserver((mutations) => {
         const seen = new Set();
         for (const mutation of mutations) {
-            for (const node of mutation.addedNodes) {
+            const nodes = [
+                mutation.target,
+                ...mutation.addedNodes,
+            ];
+            for (const node of nodes) {
                 const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
                 const messageElement = element?.matches?.('.mes[mesid]')
                     ? element
@@ -625,7 +820,12 @@ function observeChatDom() {
         }
     });
 
-    observer.observe(chatRoot, { childList: true, subtree: true });
+    observer.observe(chatRoot, {
+        attributes: true,
+        characterData: true,
+        childList: true,
+        subtree: true,
+    });
 }
 
 function init() {
