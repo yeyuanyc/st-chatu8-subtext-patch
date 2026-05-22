@@ -112,11 +112,35 @@ function getLastAssistantMessageId() {
     return null;
 }
 
-function getTargetMessageId() {
+function getActiveMessageIdOnly() {
     if (Number.isInteger(activeMessageId) && Date.now() < activeUntil && chat[activeMessageId]) {
         return activeMessageId;
     }
-    return getLastAssistantMessageId();
+    return null;
+}
+
+function getTargetMessageId() {
+    return getActiveMessageIdOnly() ?? getLastAssistantMessageId();
+}
+
+function getActionDescriptor(element) {
+    const host = element?.closest?.('button, [role="button"], a, [title], [aria-label]') || element;
+    const dataset = host?.dataset || element?.dataset || {};
+    const values = [
+        element?.textContent,
+        element?.title,
+        element?.ariaLabel,
+        element?.id,
+        element?.className,
+        host?.textContent,
+        host?.title,
+        host?.ariaLabel,
+        host?.id,
+        host?.className,
+        ...Object.values(dataset),
+    ];
+
+    return values.filter(Boolean).join(' ');
 }
 
 function markActiveMessage(messageId, reason = 'unknown') {
@@ -537,8 +561,7 @@ function shouldNormalizeFetchResponse(responseText, content = collectSseContent(
         return true;
     }
 
-    const targetId = getTargetMessageId();
-    return targetId !== null && Date.now() < activeUntil;
+    return false;
 }
 
 function makeNormalizedResponse(originalResponse, responseText, content = collectSseContent(responseText)) {
@@ -566,6 +589,7 @@ function wrapFetch() {
     const originalFetch = window.fetch.bind(window);
 
     window.fetch = async (...args) => {
+        const targetId = getTargetMessageId();
         const response = await originalFetch(...args);
 
         try {
@@ -573,14 +597,11 @@ function wrapFetch() {
             const text = await cloned.text();
             const sseContent = collectSseContent(text);
             const blocks = collectBlocksFromResponseText(text);
-            if (blocks.length > 0) {
-                const targetId = getTargetMessageId();
-                if (targetId !== null) {
-                    addPendingBlocks(targetId, blocks);
-                }
+            if (blocks.length > 0 && targetId !== null) {
+                addPendingBlocks(targetId, blocks);
             }
 
-            if (shouldNormalizeFetchResponse(text, sseContent)) {
+            if (shouldNormalizeFetchResponse(text, sseContent, targetId)) {
                 return makeNormalizedResponse(response, text, sseContent);
             }
         } catch {
@@ -603,19 +624,10 @@ function unwrapSseEnvelopeText(text) {
 function onPossibleChatu8Action(event) {
     const target = event.target;
     const id = getMessageIdFromElement(target);
+    const descriptor = getActionDescriptor(target);
 
-    if (id !== null) {
+    if (id !== null && CHATU8_ACTION_RE.test(descriptor)) {
         markActiveMessage(id, event.type);
-        return;
-    }
-
-    const text = String(target?.textContent || target?.title || target?.ariaLabel || '');
-    const className = String(target?.className || '');
-    if (CHATU8_ACTION_RE.test(`${text} ${className}`)) {
-        const fallbackId = getLastAssistantMessageId();
-        if (fallbackId !== null) {
-            markActiveMessage(fallbackId, `${event.type}:fallback`);
-        }
     }
 }
 
