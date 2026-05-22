@@ -8,7 +8,6 @@ import {
 import { extension_settings } from '../../../extensions.js';
 
 const PATCH_FLAG = '__stChatu8SubtextPatchLoaded';
-const FETCH_FLAG = '__stChatu8SubtextPatchFetchWrapped';
 const PATCH_NAME = 'st-chatu8-subtext-patch';
 const CHATU8_NAME = 'st-chatu8';
 
@@ -18,18 +17,14 @@ const CONTENT_OPEN_RE = /<content\b[^>]*>/i;
 const CONTENT_CLOSE_RE = /<\/content>/i;
 const DEFAULT_START_TAG = 'image###';
 const DEFAULT_END_TAG = '###';
-const STREAM_ENVELOPE_RE = /\b(?:data:\s*\{|choices|finish_reason|prompt_tokens|completion_tokens|chat\.completion\.chunk|\"delta\"|\"usage\")\b/i;
-const SSE_DATA_RE = /^data:\s*\{/m;
 const BODY_END_MARK = '<!-- \u6b63\u6587\u7ed3\u675f -->';
 const CHATU8_ACTION_RE = /chatu|image|novelai|nai|sd|comfy|banana|\u7ed8|\u56fe|\u751f\u6210|\u63d2\u56fe/i;
-const CHATU8_REPLY_RE = /<images?>|<\/images?>|<Tag_think>|<\/Tag_think>|regex\s*:|image#{0,3}\s*(?:Scene Composition|$)/i;
 const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const ACTIVE_TTL_MS = 3 * 60 * 1000;
 const PATCH_DEBOUNCE_MS = 160;
 
 const snapshots = new Map();
 const pendingTimers = new Map();
-const pendingImageBlocks = new Map();
 
 let activeMessageId = null;
 let activeUntil = 0;
@@ -103,24 +98,11 @@ function getMessageIdFromElement(element) {
     return Number.isInteger(id) && id >= 0 ? id : null;
 }
 
-function getLastAssistantMessageId() {
-    for (let i = chat.length - 1; i >= 0; i -= 1) {
-        if (chat[i] && !chat[i].is_user) {
-            return i;
-        }
-    }
-    return null;
-}
-
 function getActiveMessageIdOnly() {
     if (Number.isInteger(activeMessageId) && Date.now() < activeUntil && chat[activeMessageId]) {
         return activeMessageId;
     }
     return null;
-}
-
-function getTargetMessageId() {
-    return getActiveMessageIdOnly() ?? getLastAssistantMessageId();
 }
 
 function getActionDescriptor(element) {
@@ -202,7 +184,6 @@ function pruneSnapshots() {
     for (const [id, snapshot] of snapshots.entries()) {
         if (now - snapshot.time > SNAPSHOT_TTL_MS || !chat[id]) {
             snapshots.delete(id);
-            pendingImageBlocks.delete(id);
         }
     }
 }
@@ -223,12 +204,8 @@ function uniqueBlocks(blocks) {
     return result;
 }
 
-function isPollutedImageBlock(block) {
-    return STREAM_ENVELOPE_RE.test(String(block ?? ''));
-}
-
 function cleanImageBlocks(blocks) {
-    return uniqueBlocks(blocks).filter((block) => !isPollutedImageBlock(block));
+    return uniqueBlocks(blocks);
 }
 
 function extractImageBlocks(text) {
@@ -257,25 +234,12 @@ function removeImageBlocks(text) {
     return output.replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
 }
 
-function removePollutedImageBlocks(text) {
+function removeSpecificImageBlocks(text, blocks) {
     let output = String(text ?? '');
-    for (const regex of getImageRegexes()) {
-        regex.lastIndex = 0;
-        output = output.replace(regex, (block) => isPollutedImageBlock(block) ? '' : block);
+    for (const block of cleanImageBlocks(blocks)) {
+        output = output.replace(block, '');
     }
     return output.replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n');
-}
-
-function addPendingBlocks(messageId, blocks) {
-    const id = Number(messageId);
-    const cleanBlocks = cleanImageBlocks(blocks);
-    if (!Number.isInteger(id) || id < 0 || cleanBlocks.length === 0) {
-        return;
-    }
-
-    const bucket = pendingImageBlocks.get(id) || [];
-    pendingImageBlocks.set(id, uniqueBlocks([...bucket, ...cleanBlocks]));
-    schedulePatch(id, { save: true, rerender: true, reason: 'pending-image-blocks' });
 }
 
 function getInsertionIndex(base) {
@@ -339,6 +303,62 @@ function shouldRepairFromSnapshot(messageId, currentText, blocks) {
     return lostSubtextTags || hasNewImageBlocks || imageOutsideSnapshotBase;
 }
 
+async function moveBlocksToActiveMessage(sourceId, blocks, reason = 'move-blocks') {
+    const targetId = getActiveMessageIdOnly();
+    const cleanBlocks = cleanImageBlocks(blocks);
+    if (
+        targetId === null ||
+        targetId === sourceId ||
+        cleanBlocks.length === 0 ||
+        !chat[targetId] ||
+        chat[targetId].is_user
+    ) {
+        return false;
+    }
+
+    const source = chat[sourceId];
+    const target = chat[targetId];
+    const sourceText = String(source.mes ?? '');
+    const targetText = String(target.mes ?? '');
+    const cleanedSource = removeSpecificImageBlocks(sourceText, cleanBlocks);
+    const targetBase = chooseBaseText(targetId, targetText);
+    const targetBlocks = cleanImageBlocks([...extractImageBlocks(targetBase), ...cleanBlocks]);
+    const patchedTarget = mergeBlocksIntoBase(targetBase, targetBlocks);
+
+    if (cleanedSource !== sourceText) {
+        source.mes = cleanedSource;
+        updateMessageBlock(sourceId, source);
+        snapshots.set(sourceId, {
+            text: cleanedSource,
+            score: snapshotScore(cleanedSource),
+            reason: `patched:${reason}:source`,
+            time: Date.now(),
+        });
+    }
+
+    if (patchedTarget !== targetText) {
+        target.mes = patchedTarget;
+        updateMessageBlock(targetId, target);
+        snapshots.set(targetId, {
+            text: patchedTarget,
+            score: snapshotScore(patchedTarget),
+            reason: `patched:${reason}:target`,
+            time: Date.now(),
+        });
+    }
+
+    if (cleanedSource !== sourceText || patchedTarget !== targetText) {
+        scheduleSave();
+        console.info(`[${PATCH_NAME}] moved image blocks ${sourceId} -> ${targetId}`, {
+            reason,
+            blocks: cleanBlocks.length,
+        });
+        return true;
+    }
+
+    return false;
+}
+
 async function patchMessage(messageId, { save = false, rerender = true, reason = 'event' } = {}) {
     const id = Number(messageId);
     if (!Number.isInteger(id) || id < 0 || !chat[id] || chat[id].is_user) {
@@ -347,33 +367,24 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
 
     const message = chat[id];
     const rawCurrentText = String(message.mes ?? '');
-    const unwrappedText = unwrapSseEnvelopeText(rawCurrentText);
-    const currentText = removePollutedImageBlocks(unwrappedText);
+    const currentText = rawCurrentText;
     const currentBlocks = extractImageBlocks(currentText);
-    const queuedBlocks = pendingImageBlocks.get(id) || [];
-    const allBlocks = cleanImageBlocks([...currentBlocks, ...queuedBlocks]);
+    const allBlocks = cleanImageBlocks(currentBlocks);
     const snapshot = snapshots.get(id)?.text;
+    const newBlocks = snapshot
+        ? allBlocks.filter((block) => !snapshot.includes(block))
+        : [];
+
+    if (newBlocks.length > 0 && await moveBlocksToActiveMessage(id, newBlocks, reason)) {
+        return true;
+    }
 
     if (!snapshot && allBlocks.length === 0) {
-        if (currentText !== rawCurrentText) {
-            message.mes = currentText;
-            if (rerender) {
-                updateMessageBlock(id, message);
-            }
-            if (save) {
-                scheduleSave();
-            }
-            return true;
-        }
         snapshotMessage(id, reason, false);
         return false;
     }
 
     let patched = currentText;
-
-    if (snapshot && isSseEnvelopeText(rawCurrentText) && allBlocks.length === 0) {
-        patched = snapshot;
-    }
 
     if (allBlocks.length > 0 || shouldRepairFromSnapshot(id, currentText, allBlocks)) {
         const base = chooseBaseText(id, currentText);
@@ -390,7 +401,6 @@ async function patchMessage(messageId, { save = false, rerender = true, reason =
     }
 
     message.mes = patched;
-    pendingImageBlocks.delete(id);
     snapshots.set(id, {
         text: patched,
         score: snapshotScore(patched),
@@ -437,188 +447,6 @@ function patchAll(options = {}) {
     for (let i = 0; i < chat.length; i += 1) {
         schedulePatch(i, options);
     }
-}
-
-function collectStrings(value, result = []) {
-    if (typeof value === 'string') {
-        result.push(value);
-        return result;
-    }
-
-    if (Array.isArray(value)) {
-        for (const item of value) {
-            collectStrings(item, result);
-        }
-        return result;
-    }
-
-    if (value && typeof value === 'object') {
-        for (const item of Object.values(value)) {
-            collectStrings(item, result);
-        }
-    }
-
-    return result;
-}
-
-function collectSseContent(responseText) {
-    const parts = [];
-    const events = String(responseText ?? '').split(/\r?\n\r?\n/);
-
-    for (const event of events) {
-        const lines = event.split(/\r?\n/);
-        for (const line of lines) {
-            if (!line.startsWith('data:')) {
-                continue;
-            }
-
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') {
-                continue;
-            }
-
-            try {
-                const parsed = JSON.parse(payload);
-                const deltaContent = parsed?.choices?.[0]?.delta?.content;
-                const messageContent = parsed?.choices?.[0]?.message?.content;
-                const text = deltaContent ?? messageContent;
-                if (typeof text === 'string') {
-                    parts.push(text);
-                }
-            } catch {
-                // Ignore non-JSON SSE lines.
-            }
-        }
-    }
-
-    return parts.join('');
-}
-
-function collectJsonContent(responseText) {
-    try {
-        const parsed = JSON.parse(responseText);
-        const preferred = [
-            parsed?.choices?.[0]?.message?.content,
-            parsed?.choices?.[0]?.delta?.content,
-            parsed?.message?.content,
-            parsed?.content,
-            parsed?.text,
-        ].filter((item) => typeof item === 'string');
-
-        if (preferred.length > 0) {
-            return preferred.join('');
-        }
-
-        return collectStrings(parsed).join('\n');
-    } catch {
-        return '';
-    }
-}
-
-function collectBlocksFromResponseText(responseText) {
-    const text = String(responseText ?? '');
-    const blocks = [];
-    const sseContent = collectSseContent(text);
-    const jsonContent = collectJsonContent(text);
-
-    if (sseContent) {
-        blocks.push(...extractImageBlocks(sseContent));
-    }
-
-    if (jsonContent) {
-        blocks.push(...extractImageBlocks(jsonContent));
-    }
-
-    if (!sseContent && !jsonContent && !/^data:\s*\{/m.test(text)) {
-        blocks.push(...extractImageBlocks(text));
-    }
-
-    return cleanImageBlocks(blocks);
-}
-
-function isSseEnvelopeText(text) {
-    return SSE_DATA_RE.test(String(text ?? '')) && /\"delta\"\s*:\s*\{/.test(String(text ?? ''));
-}
-
-function contentToOpenAiJson(content) {
-    return JSON.stringify({
-        choices: [
-            {
-                message: { content },
-                delta: { content },
-                finish_reason: 'stop',
-            },
-        ],
-    });
-}
-
-function shouldNormalizeFetchResponse(responseText, content = collectSseContent(responseText)) {
-    if (!isSseEnvelopeText(responseText)) {
-        return false;
-    }
-
-    if (CHATU8_REPLY_RE.test(content) || hasImageBlock(content)) {
-        return true;
-    }
-
-    return false;
-}
-
-function makeNormalizedResponse(originalResponse, responseText, content = collectSseContent(responseText)) {
-    if (!content) {
-        return originalResponse;
-    }
-
-    const headers = new Headers(originalResponse.headers);
-    headers.set('content-type', 'application/json; charset=utf-8');
-    headers.delete('content-length');
-
-    return new Response(contentToOpenAiJson(content), {
-        status: originalResponse.status,
-        statusText: originalResponse.statusText,
-        headers,
-    });
-}
-
-function wrapFetch() {
-    if (window[FETCH_FLAG] || typeof window.fetch !== 'function') {
-        return;
-    }
-
-    window[FETCH_FLAG] = true;
-    const originalFetch = window.fetch.bind(window);
-
-    window.fetch = async (...args) => {
-        const targetId = getTargetMessageId();
-        const response = await originalFetch(...args);
-
-        try {
-            const cloned = response.clone();
-            const text = await cloned.text();
-            const sseContent = collectSseContent(text);
-            const blocks = collectBlocksFromResponseText(text);
-            if (blocks.length > 0 && targetId !== null) {
-                addPendingBlocks(targetId, blocks);
-            }
-
-            if (shouldNormalizeFetchResponse(text, sseContent, targetId)) {
-                return makeNormalizedResponse(response, text, sseContent);
-            }
-        } catch {
-            // Some streamed responses cannot be cloned in every browser path.
-        }
-
-        return response;
-    };
-}
-
-function unwrapSseEnvelopeText(text) {
-    if (!isSseEnvelopeText(text)) {
-        return text;
-    }
-
-    const content = collectSseContent(text);
-    return content || text;
 }
 
 function onPossibleChatu8Action(event) {
@@ -701,7 +529,6 @@ function init() {
     }
 
     window[PATCH_FLAG] = true;
-    wrapFetch();
     bindEvents();
     observeChatDom();
     setTimeout(() => {
